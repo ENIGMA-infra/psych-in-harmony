@@ -15,4 +15,7 @@
 *.png
 *.jpg
 *.jpeg
-code/*/output_*
+code/clustering/output_*
+code/similarity-analysis/output_*
+code/similarity-visualization/output_*
+
