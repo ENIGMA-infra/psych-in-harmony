@@ -1,7 +1,8 @@
 """
 ============================================================================
-MULTI-KAPPA SIMULATION: Validation Across Agreement Levels
+MULTI-KAPPA SIMULATION
 Sample Size Determination for Expert Rater Survey
+Array-compatible version for HPC cluster processing
 ============================================================================
 """
 
@@ -14,13 +15,16 @@ from tqdm import tqdm
 from joblib import Parallel, delayed
 from pathlib import Path
 import warnings
+import argparse
 warnings.filterwarnings('ignore')
 
 plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_palette("husl")
-np.random.seed(42)
 
-# [survey_structure definition]
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 survey_structure = {
     'Depression': {
         'dimensions': ['Mood_Affective', 'Cognitive_SelfPerception', 
@@ -51,7 +55,9 @@ survey_structure = {
     }
 }
 
-# calculate_fleiss_kappa_from_ratings, simulate_expert_ratings_direct, etc.
+# ============================================================================
+# ANALYSIS FUNCTIONS
+# ============================================================================
 
 def calculate_fleiss_kappa_from_ratings(ratings, n_categories):
     """Calculate Fleiss' kappa from raw ratings array."""
@@ -76,28 +82,146 @@ def calculate_fleiss_kappa_from_ratings(ratings, n_categories):
     kappa = (P_bar - P_e) / (1 - P_e)
     return kappa
 
-def simulate_expert_ratings_direct(n_raters, n_items, n_categories, target_kappa=0.50):
-    """Simulate expert ratings using direct agreement probability method."""
+def generate_dimensional_distribution(n_items, n_categories, balance='random'):
+    """
+    Generate item-to-dimension assignments with various balance levels.
+    
+    Parameters:
+    -----------
+    n_items : int
+        Total number of items
+    n_categories : int
+        Number of dimensions
+    balance : str or array
+        - 'even': Distribute items evenly (balanced)
+        - 'random': Random distribution using Dirichlet
+        - 'imbalanced': Deliberately create imbalance
+        - array: Explicit proportions (must sum to 1.0)
+    
+    Returns:
+    --------
+    true_dimensions : array
+        Assignment of each item to a dimension
+    distribution : dict
+        Items per dimension for debugging
+    """
+    if isinstance(balance, (list, np.ndarray)):
+        # Explicit proportions provided
+        proportions = np.array(balance)
+        proportions = proportions / proportions.sum()  # Normalize
+    elif balance == 'even':
+        # Even distribution
+        proportions = np.ones(n_categories) / n_categories
+    elif balance == 'imbalanced':
+        # Deliberately imbalanced: one large dimension, others smaller
+        proportions = np.array([0.5] + [0.5/(n_categories-1)]*(n_categories-1))
+    elif balance == 'random':
+        # Random distribution using Dirichlet
+        # Alpha = 2 creates moderate variability 
+        proportions = np.random.dirichlet([2.0] * n_categories)
+    else:
+        raise ValueError(f"Unknown balance type: {balance}")
+    
+    # Convert proportions to item counts
+    item_counts = np.round(proportions * n_items).astype(int)
+    
+    # Adjust for rounding errors
+    diff = n_items - item_counts.sum()
+    if diff > 0:
+        # Add missing items to dimensions with fewest items
+        for _ in range(diff):
+            item_counts[np.argmin(item_counts)] += 1
+    elif diff < 0:
+        # Remove excess items from dimensions with most items
+        for _ in range(-diff):
+            item_counts[np.argmax(item_counts)] -= 1
+    
+    # Create assignment array
+    true_dimensions = []
+    for dim in range(n_categories):
+        true_dimensions.extend([dim] * item_counts[dim])
+    
+    true_dimensions = np.array(true_dimensions)
+    np.random.shuffle(true_dimensions)  # Randomize order
+    
+    distribution = {f'dim_{i}': count for i, count in enumerate(item_counts)}
+    
+    return true_dimensions, distribution
+
+
+def simulate_expert_ratings_direct(n_raters, n_items, n_categories, target_kappa=0.50, 
+                                   dimension_balance='random'):
+    """
+    Simulate expert ratings for dimensional classification.
+    
+    Each item has a TRUE dimension assignment (ground truth).
+    Experts attempt to classify items into dimensions with agreement level = target_kappa.
+    
+    Dimensional distributions (even, random, imbalanced) to model uncertainty 
+    about true item distribution across dimensions.
+    
+    Parameters:
+    -----------
+    n_raters : int
+        Number of expert raters
+    n_items : int
+        Number of items to classify
+    n_categories : int
+        Number of dimensions/categories
+    target_kappa : float
+        Target inter-rater agreement (Fleiss' kappa)
+    dimension_balance : str or array
+        How items are distributed across dimensions:
+        - 'even': Balanced distribution
+        - 'random': Random distribution (DEFAULT - models uncertainty)
+        - 'imbalanced': Deliberately imbalanced
+        - array: Explicit proportions
+    
+    Returns:
+    --------
+    ratings : array (n_items × n_raters)
+        Expert dimensional classifications
+    """
+    # Calculate required agreement probability
     P_e = 1.0 / n_categories
     required_P = target_kappa * (1 - P_e) + P_e
     agree_prob = np.sqrt(required_P) if required_P >= 0 else 0.0
     agree_prob = np.clip(agree_prob, 1.0/n_categories, 1.0)
-    reference_categories = np.random.randint(0, n_categories, size=n_items)
+    
+    # Generate dimensional assignments
+    true_dimensions, _ = generate_dimensional_distribution(n_items, n_categories, dimension_balance)
+    
+    # Initialize ratings matrix
     ratings = np.zeros((n_items, n_raters), dtype=int)
     
+    # Generate expert ratings
+    # For each item, establish a "consensus" classification
     for i in range(n_items):
-        ref_cat = reference_categories[i]
+        true_dim = true_dimensions[i]
+        
+        # The "consensus" dimension is usually (but not always) the true dimension
+        # This models that experts usually agree on clear items, but may consensually 
+        # misclassify ambiguous items
+        if np.random.random() < 0.8:  # 80% of items: consensus = true dimension
+            consensus_dim = true_dim
+        else:  # 20% of items: consensus is another dimension (ambiguous items)
+            other_dims = [d for d in range(n_categories) if d != true_dim]
+            consensus_dim = np.random.choice(other_dims) if other_dims else true_dim
+        
+        # Generate rater classifications based on consensus
         for r in range(n_raters):
             if np.random.random() < agree_prob:
-                ratings[i, r] = ref_cat
+                # Agree with consensus
+                ratings[i, r] = consensus_dim
             else:
-                other_cats = [c for c in range(n_categories) if c != ref_cat]
-                ratings[i, r] = np.random.choice(other_cats)
+                # Disagree - choose randomly from other dimensions
+                other_dims = [d for d in range(n_categories) if d != consensus_dim]
+                ratings[i, r] = np.random.choice(other_dims) if other_dims else consensus_dim
     
     return ratings
 
 def analyze_stability(construct_info, true_kappa, max_raters, n_iterations):
-    """Analyze stability (from previous script)."""
+    """Analyze stability across increasing number of raters."""
     n_items = construct_info['n_items']
     n_categories = len(construct_info['dimensions'])
     results = []
@@ -140,7 +264,7 @@ def analyze_stability(construct_info, true_kappa, max_raters, n_iterations):
     return stability_summary
 
 def analyze_precision_bootstrap(construct_info, n_raters_range, true_kappa, n_iterations, n_bootstrap):
-    """Analyze precision with bootstrap (from previous script)."""
+    """Analyze precision with bootstrap confidence intervals."""
     n_items = construct_info['n_items']
     n_categories = len(construct_info['dimensions'])
     results = []
@@ -172,7 +296,7 @@ def analyze_precision_bootstrap(construct_info, n_raters_range, true_kappa, n_it
     return pd.DataFrame(results)
 
 def analyze_replication_variability(construct_info, n_raters_range, true_kappa, n_iterations):
-    """Analyze replication variability (from previous script)."""
+    """Analyze replication variability across independent samples."""
     n_items = construct_info['n_items']
     n_categories = len(construct_info['dimensions'])
     results = []
@@ -189,13 +313,13 @@ def analyze_replication_variability(construct_info, n_raters_range, true_kappa, 
         sd_across_samples = np.std(kappas_all)
         cv = sd_across_samples / mean_kappa if mean_kappa > 0 else np.nan
         
-        percentile_2_5 = np.percentile(kappas_all, 2.5)
-        percentile_97_5 = np.percentile(kappas_all, 97.5)
-        range_95 = percentile_97_5 - percentile_2_5
+        ci_lower_95 = np.percentile(kappas_all, 2.5)
+        ci_upper_95 = np.percentile(kappas_all, 97.5)
+        range_95 = ci_upper_95 - ci_lower_95
         
-        percentile_5 = np.percentile(kappas_all, 5)
-        percentile_95 = np.percentile(kappas_all, 95)
-        range_90 = percentile_95 - percentile_5
+        ci_lower_90 = np.percentile(kappas_all, 5)
+        ci_upper_90 = np.percentile(kappas_all, 95)
+        range_90 = ci_upper_90 - ci_lower_90
         
         results.append({
             'n_raters': n_raters,
@@ -209,16 +333,21 @@ def analyze_replication_variability(construct_info, n_raters_range, true_kappa, 
     return pd.DataFrame(results)
 
 # ============================================================================
-# MULTI-KAPPA COMPARISON PLOTS
+# PLOTTING FUNCTIONS
 # ============================================================================
 
 def plot_stability_comparison(all_stability_df, construct_name, save_path):
-    """Compare stability across different true kappa values."""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    """Create comparison plots for stability across kappa values."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    colors = {'0.40': '#e74c3c', '0.50': '#3498db', '0.60': '#2ecc71', '0.70': '#9b59b6'}
+    colors = {
+        '0.40': '#e74c3c',
+        '0.50': '#3498db', 
+        '0.60': '#2ecc71',
+        '0.70': '#9b59b6'
+    }
     
-    # Plot 1: Mean kappa estimate
+    # Kappa estimates
     ax = axes[0, 0]
     for true_kappa in sorted(all_stability_df['true_kappa'].unique()):
         data = all_stability_df[all_stability_df['true_kappa'] == true_kappa]
@@ -233,7 +362,7 @@ def plot_stability_comparison(all_stability_df, construct_name, save_path):
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # Plot 2: Change in estimate (stability)
+    # Mean change
     ax = axes[0, 1]
     for true_kappa in sorted(all_stability_df['true_kappa'].unique()):
         data = all_stability_df[all_stability_df['true_kappa'] == true_kappa]
@@ -250,7 +379,7 @@ def plot_stability_comparison(all_stability_df, construct_name, save_path):
     ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
     
-    # Plot 3: SD (precision)
+    # SD of estimates
     ax = axes[1, 0]
     for true_kappa in sorted(all_stability_df['true_kappa'].unique()):
         data = all_stability_df[all_stability_df['true_kappa'] == true_kappa]
@@ -266,7 +395,7 @@ def plot_stability_comparison(all_stability_df, construct_name, save_path):
     ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
     
-    # Plot 4: Convergence
+    # Convergence
     ax = axes[1, 1]
     for true_kappa in sorted(all_stability_df['true_kappa'].unique()):
         data = all_stability_df[all_stability_df['true_kappa'] == true_kappa]
@@ -291,29 +420,33 @@ def plot_stability_comparison(all_stability_df, construct_name, save_path):
     plt.close()
 
 def plot_precision_comparison(all_precision_df, construct_name, save_path):
-    """Compare precision across different true kappa values."""
-    fig, ax = plt.subplots(figsize=(10, 6))
+    """Create comparison plot for precision across kappa values."""
+    fig, ax = plt.subplots(figsize=(10, 7))
     
-    colors = {'0.40': '#e74c3c', '0.50': '#3498db', '0.60': '#2ecc71', '0.70': '#9b59b6'}
+    colors = {
+        '0.40': '#e74c3c',
+        '0.50': '#3498db',
+        '0.60': '#2ecc71', 
+        '0.70': '#9b59b6'
+    }
     
     for true_kappa in sorted(all_precision_df['true_kappa'].unique()):
         data = all_precision_df[all_precision_df['true_kappa'] == true_kappa]
         ax.plot(data['n_raters'], data['mean_ci_width'],
-               marker='o', linewidth=2, markersize=6,
+               marker='o', linewidth=2.5, markersize=6,
                label=f'True κ = {true_kappa:.2f}',
                color=colors[f'{true_kappa:.2f}'])
     
-    ax.axhline(y=0.10, linestyle='--', color='red', alpha=0.5,
-              label='Target (±0.05)')
-    ax.axhline(y=0.15, linestyle='--', color='orange', alpha=0.5,
-              label='Acceptable (±0.075)')
+    ax.axhline(y=0.10, linestyle='--', color='#e74c3c', linewidth=2, 
+              alpha=0.7, label='Target (±0.05)')
+    ax.axhline(y=0.15, linestyle='--', color='#f39c12', linewidth=2,
+              alpha=0.7, label='Acceptable (±0.075)')
     
     ax.set_xlabel('Number of Raters', fontsize=12)
     ax.set_ylabel('95% CI Width', fontsize=12)
-    ax.set_title(f'Precision Comparison: {construct_name}\n' +
-                'Bootstrap CIs Across Agreement Levels',
+    ax.set_title(f'Precision Comparison: {construct_name}\nBootstrap CIs Across Agreement Levels',
                 fontsize=14, fontweight='bold')
-    ax.legend()
+    ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
     
@@ -323,10 +456,15 @@ def plot_precision_comparison(all_precision_df, construct_name, save_path):
     plt.close()
 
 def plot_replication_comparison(all_replication_df, construct_name, save_path):
-    """Compare replication variability across true kappa values."""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    """Create comparison plots for replication variability across kappa values."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    colors = {'0.40': '#e74c3c', '0.50': '#3498db', '0.60': '#2ecc71', '0.70': '#9b59b6'}
+    colors = {
+        '0.40': '#e74c3c',
+        '0.50': '#3498db',
+        '0.60': '#2ecc71',
+        '0.70': '#9b59b6'
+    }
     
     # SD across samples
     ax = axes[0, 0]
@@ -404,24 +542,23 @@ def plot_replication_comparison(all_replication_df, construct_name, save_path):
     plt.close()
 
 # ============================================================================
-# RUN MULTI-KAPPA ANALYSES
+# MAIN ANALYSIS FUNCTION
 # ============================================================================
 
-def run_multi_kappa_analyses(construct_name, true_kappa_range=None):
+def run_multi_kappa_analyses(construct_name, true_kappa_range=None, random_seed=None):
     """
-    Run enhanced analyses across multiple true kappa values.
-    
-    This allows you to:
-    1. Plan conservatively using worst-case (lowest kappa)
-    2. Report results conditional on observed kappa
-    3. Validate adequacy post-hoc after data collection
+    Run analyses across multiple true kappa values.
     """
     if true_kappa_range is None:
         true_kappa_range = [0.40, 0.50, 0.60, 0.70]
     
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    
     print("\n" + "="*70)
     print(f"MULTI-KAPPA ANALYSES: {construct_name}")
     print(f"Testing κ = {true_kappa_range}")
+    print(f"Random seed: {random_seed}")
     print("="*70 + "\n")
     
     construct_info = survey_structure[construct_name]
@@ -441,8 +578,8 @@ def run_multi_kappa_analyses(construct_name, true_kappa_range=None):
         stability_df = analyze_stability(
             construct_info=construct_info,
             true_kappa=true_kappa,
-            max_raters=30,
-            n_iterations=100
+            max_raters=50,
+            n_iterations=1000
         )
         stability_df['true_kappa'] = true_kappa
         all_stability_data.append(stability_df)
@@ -450,20 +587,20 @@ def run_multi_kappa_analyses(construct_name, true_kappa_range=None):
         # Precision
         precision_df = analyze_precision_bootstrap(
             construct_info=construct_info,
-            n_raters_range=[5, 8, 10, 12, 15, 18, 20, 25, 30],
+            n_raters_range=[5, 10, 15, 20, 25, 30, 35, 40, 45, 50],
             true_kappa=true_kappa,
-            n_iterations=100,
+            n_iterations=1000,
             n_bootstrap=500
         )
         precision_df['true_kappa'] = true_kappa
         all_precision_data.append(precision_df)
         
-        # Replication
+        # Replication (increased to 500 iterations)
         replication_df = analyze_replication_variability(
             construct_info=construct_info,
-            n_raters_range=[5, 8, 10, 12, 15, 18, 20, 25, 30],
+            n_raters_range=[5, 10, 15, 20, 25, 30, 35, 40, 45, 50],
             true_kappa=true_kappa,
-            n_iterations=500
+            n_iterations=1000  
         )
         replication_df['true_kappa'] = true_kappa
         all_replication_data.append(replication_df)
@@ -526,54 +663,49 @@ def run_multi_kappa_analyses(construct_name, true_kappa_range=None):
     return recommendations_df
 
 # ============================================================================
-# MAIN EXECUTION
+# COMMAND-LINE INTERFACE
 # ============================================================================
 
 def main():
-    """Run multi-kappa analyses for all constructs."""
-    print("="*70)
-    print("MULTI-KAPPA SIMULATION STUDY")
-    print("Sample Size Validation Across Agreement Levels")
-    print("="*70 + "\n")
-    
-    output_dir = Path('simulation_results_multikappa')
-    output_dir.mkdir(exist_ok=True)
-    
-    all_construct_recommendations = []
-    
-    for construct_name in survey_structure.keys():
-        recommendations_df = run_multi_kappa_analyses(
-            construct_name=construct_name,
-            true_kappa_range=[0.40, 0.50, 0.60, 0.70]
-        )
-        all_construct_recommendations.append(recommendations_df)
-    
-    # Consolidated recommendations across all constructs
-    all_recs = pd.concat(all_construct_recommendations, ignore_index=True)
-    all_recs.to_csv(output_dir / 'all_constructs_all_kappas.csv', index=False)
-    
-    print("\n" + "="*70)
-    print("COMPLETE!")
-    print("="*70)
-    print(f"\nResults saved to: {output_dir.absolute()}/")
-
-def quick_test():
-    """Quick test on Depression only."""
-    print("="*70)
-    print("QUICK TEST: Depression Across Multiple Kappas")
-    print("="*70 + "\n")
-    
-    recommendations_df = run_multi_kappa_analyses(
-        construct_name='Depression',
-        true_kappa_range=[0.40, 0.50, 0.60, 0.70]
+    """Parse command-line arguments and run analysis."""
+    parser = argparse.ArgumentParser(
+        description='Multi-Kappa Analysis for Expert Rater Survey Sample Size Determination'
+    )
+    parser.add_argument(
+        '--construct',
+        type=str,
+        required=True,
+        choices=list(survey_structure.keys()),
+        help='Neuropsychiatric construct to analyze'
+    )
+    parser.add_argument(
+        '--kappa-range',
+        nargs='+',
+        type=float,
+        default=[0.40, 0.50, 0.60, 0.70],
+        help='True kappa values to test (default: 0.40 0.50 0.60 0.70)'
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed for reproducibility (default: 42)'
     )
     
-    print("\n✓ Test complete!")
+    args = parser.parse_args()
+    
+    print("="*70)
+    print("MULTI-KAPPA SIMULATION: HPC Array Job")
+    print("ENIGMA-PD Harmonization Study")
+    print("="*70)
+    
+    recommendations_df = run_multi_kappa_analyses(
+        construct_name=args.construct,
+        true_kappa_range=args.kappa_range,
+        random_seed=args.seed
+    )
+    
+    print("\n✓ Analysis complete!")
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == '--full':
-        main()
-    else:
-        quick_test()
+    main()
