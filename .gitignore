@@ -18,6 +18,6 @@
 code/clustering/output_*
 code/similarity-analysis/output_*
 code/similarity-visualization/output_*
-code/similarity-analysis/old/*
-code/input/*
-code/output/*
+code/similarity-analysis/old/
+code/input/
+code/output/
